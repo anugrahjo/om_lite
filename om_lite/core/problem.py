@@ -1,7 +1,240 @@
 from om_lite.core.options_dictionary import OptionsDictionary
+from lsdo_optimizer.api import Problem as OptProblem
+
+import numpy as np
+import scipy.sparse as sp
+
+from array_manager.api import VectorComponentsDict, MatrixComponentsDict, Matrix, CSCMatrix
 
 
-class Problem(object):
+class Problem(OptProblem):
+    # self.n = n = model.nx + model.ny
+    def __init__(self, model, formulation='surf', res_tol=1e-2):
+        self.model = model
+        self.formulation = formulation
+        self.res_tol = res_tol
+        self.nx = model.nx
+        self.ny = model.ny
+        self.n = n = self.nx + self.ny
+        # self.nc = 1 + 2 * self.nx
+        self.psi = None
+        self.hot_x_for_fn_evals = np.full((n, ), np.inf)
+        self.hot_x_for_deriv_evals = np.full((n, ), np.inf)
+
+        self.cons_and_res_vector_dict = VectorComponentsDict()
+        self.x_and_y_vector_dict = VectorComponentsDict()
+
+        self.initialize()
+
+        self.full_partials_dict = MatrixComponentsDict(
+            self.cons_and_res_vector_dict, self.x_and_y_vector_dict)
+
+        vals = np.ones(self.nx)
+        indices = np.arange(self.nx)
+
+        self.full_partials_dict['average_density',
+                                'x'] = dict(shape=(1, self.nx))
+        self.full_partials_dict['density_lower_bound',
+                                'x'] = dict(vals=vals,
+                                            rows=indices,
+                                            cols=indices)
+        self.full_partials_dict['density_upper_bound',
+                                'x'] = dict(vals=-vals,
+                                            rows=indices,
+                                            cols=indices)
+
+        x_val = np.full((self.nx, ), 1.)
+        y_val = np.full((self.ny, ), 1.)
+        psi = np.full((self.ny, ), 1.)
+
+        self.y_val, self.f, self.res, self.c = self.model.evaluate_functions(
+            x_val, y_val, method=self.formulation, tol=self.res_tol)
+        self.hot_x_for_fn_evals[:] = np.append(x_val, y_val)
+
+        pf_px, pf_py, pc_px, pc_py, psi, pR_px, pR_py = self.model.evaluate_derivatives(
+            x_val, y_val, psi, method=self.formulation, tol=self.res_tol)
+        self.hot_x_for_deriv_evals[:] = np.append(x_val, y_val)
+
+        # pR_px_full = sp.vstack([pR_px, -pR_px])
+        cols = pR_px.indices
+        ind_ptr = pR_px.indptr
+        # print(ind_ptr.dtype)
+        self.full_partials_dict['residuals+', 'x'] = dict(cols=cols,
+                                                          ind_ptr=ind_ptr)
+        self.full_partials_dict['residuals-', 'x'] = dict(cols=cols,
+                                                          ind_ptr=ind_ptr)
+
+        # pR_py_full = sp.vstack([pR_py, -pR_py])
+        rows = pR_py.row
+        cols = pR_py.col
+        self.full_partials_dict['residuals+', 'y'] = dict(rows=rows, cols=cols)
+        self.full_partials_dict['residuals-', 'y'] = dict(rows=rows, cols=cols)
+
+        self.full_jac_matrix = Matrix(self.full_partials_dict)
+        self.full_jac_matrix.allocate()
+        self.full_jac_csc = CSCMatrix(self.full_jac_matrix)
+
+    def evaluate_objective(self, x):
+        # if self.hot_x_for_fn_evals != x:
+        if not (np.array_equal(self.hot_x_for_fn_evals, x)):
+            nx = self.nx
+            self.y_val, self.f, self.res, self.c = self.model.evaluate_functions(
+                x[:nx], x[nx:], method=self.formulation, tol=self.res_tol)
+            self.hot_x_for_fn_evals[:] = 1. * x
+
+        return self.f
+
+    def compute_states(self, x):
+        # if self.hot_x_for_fn_evals != x:
+        if not (np.array_equal(self.hot_x_for_fn_evals, x)):
+            nx = self.nx
+            self.y_val, self.f, self.res, self.c = self.model.evaluate_functions(
+                x[:nx], x[nx:], method=self.formulation, tol=self.res_tol)
+            self.hot_x_for_fn_evals[:] = 1. * x
+
+        return self.y_val
+
+    def evaluate_constraints(self, x):
+        # if self.hot_x_for_fn_evals != x:
+        nx = self.nx
+        if not (np.array_equal(self.hot_x_for_fn_evals, x)):
+            self.y_val, self.f, self.res, self.c = self.model.evaluate_functions(
+                x[:nx], x[nx:], method=self.formulation, tol=self.res_tol)
+            self.hot_x_for_fn_evals[:] = 1. * x
+
+        # bound_constraints = x[:nx]
+        bound_constraints_upp = model.bound_constraints['upper'] - x[:nx]
+        bound_constraints_low = x[:nx] - model.bound_constraints['lower']
+
+        # return np.concatenate(([c - 0.5], bound_constraints))
+        return np.concatenate(
+            ([self.c - 0.5], bound_constraints_low, bound_constraints_upp))
+        # return np.concatenate(([0.5 - c], bound_constraints_low, bound_constraints_upp))
+
+    def evaluate_constraints_and_residuals(self, x):
+        # if self.hot_x_for_fn_evals != x:
+        nx = self.nx
+        if not (np.array_equal(self.hot_x_for_fn_evals, x)):
+            self.y_val, self.f, self.res, self.c = self.model.evaluate_functions(
+                x[:nx], x[nx:], method=self.formulation, tol=self.res_tol)
+            self.hot_x_for_fn_evals[:] = 1. * x
+
+        bound_constraints_low = x[:nx] - self.model.bound_constraints['lower']
+        bound_constraints_upp = self.model.bound_constraints['upper'] - x[:nx]
+
+        return np.concatenate(([0.5 - self.c], bound_constraints_low,
+                               bound_constraints_upp, self.res, -self.res))
+
+    def evaluate_residuals(self, x):
+        # if self.hot_x_for_fn_evals != x:
+        if not (np.array_equal(self.hot_x_for_fn_evals, x)):
+            nx = self.nx
+            self.y_val, self.f, self.res, self.c = self.model.evaluate_functions(
+                x[:nx], x[nx:], method=self.formulation, tol=self.res_tol)
+            self.hot_x_for_fn_evals[:] = 1. * x
+
+        return self.res
+
+    def solve_residual_equations(self, x, tol):
+        # if self.hot_x_for_fn_evals != x:
+        if not (np.array_equal(self.hot_x_for_fn_evals, x)):
+            nx = self.nx
+            self.y_val, self.f, self.res, self.c = self.model.evaluate_functions(
+                x[:nx],
+                x[nx:],
+                self.psi,
+                method=self.formulation,
+                tol=self.res_tol)
+            self.hot_x_for_fn_evals[:] = 1. * x
+
+        return self.y_val
+
+    def compute_gradient(self, x):
+        # if self.hot_x_for_deriv_evals != x.any():
+        if not (np.array_equal(self.hot_x_for_deriv_evals, x)):
+            nx = self.nx
+            self.pf_px, self.pf_py, self.pc_px, self.pc_py, self.psi, self.pR_px, self.pR_py = self.model.evaluate_derivatives(
+                x[:nx],
+                x[nx:],
+                self.psi,
+                method=self.formulation,
+                tol=self.res_tol)
+            self.hot_x_for_deriv_evals[:] = 1. * x
+
+        return np.append(self.pf_px, self.pf_py)
+
+    def compute_constraint_jacobian(self, x):
+        # if self.hot_x_for_deriv_evals != x:
+        nx = self.nx
+        ny = self.ny
+        if not (np.array_equal(self.hot_x_for_deriv_evals, x)):
+            self.pf_px, self.pf_py, self.pc_px, self.pc_py, self.psi, self.pR_px, self.pR_py = self.model.evaluate_derivatives(
+                x[:nx],
+                x[nx:],
+                self.psi,
+                method=self.formulation,
+                tol=self.res_tol)
+            self.hot_x_for_deriv_evals[:] = 1. * x
+
+        # pc_pv = -np.append(self.pc_px, self.pc_py).reshape((1, nx+ny))
+        pc_pv = np.append(self.pc_px, self.pc_py).reshape((1, nx + ny))
+        pLB_pv = np.append(np.identity(nx), np.zeros((nx, ny)), axis=1)
+
+        return sp.csc_matrix(np.concatenate((pc_pv, pLB_pv, -pLB_pv)))
+
+    def compute_residual_jacobian(self, x):
+        # if self.hot_x_for_deriv_evals != x:
+        if not (np.array_equal(self.hot_x_for_deriv_evals, x)):
+            nx = self.nx
+            self.pf_px, self.pf_py, self.pc_px, self.pc_py, self.psi, self.pR_px, self.pR_py = self.model.evaluate_derivatives(
+                x[:nx],
+                x[nx:],
+                self.psi,
+                method=self.formulation,
+                tol=self.res_tol)
+            self.hot_x_for_deriv_evals[:] = 1. * x
+
+        # print(self.pR_px, self.pR_py.shape)
+        return sp.hstack((self.pR_px, self.pR_py))
+
+    def compute_constraint_and_residual_jacobian(self, x):
+        # if self.hot_x_for_deriv_evals != x:
+        if not (np.array_equal(self.hot_x_for_deriv_evals, x)):
+            nx = self.nx
+            self.pf_px, self.pf_py, self.pc_px, self.pc_py, self.psi, self.pR_px, self.pR_py = self.model.evaluate_derivatives(
+                x[:nx],
+                x[nx:],
+                self.psi,
+                method=self.formulation,
+                tol=self.res_tol)
+            self.hot_x_for_deriv_evals[:] = 1. * x
+
+        self.full_jac_matrix['average_density', 'x'] = -self.pc_px
+        self.full_jac_matrix['residuals+', 'x'] = self.pR_px.data
+        self.full_jac_matrix['residuals-', 'x'] = -self.pR_px.data
+        self.full_jac_matrix['residuals+', 'y'] = self.pR_py.data
+        self.full_jac_matrix['residuals-', 'y'] = -self.pR_py.data
+
+        self.full_jac_csc.update_bottom_up()
+
+        return self.full_jac_csc.scipy_sparse_array()
+
+    def compute_adjoint_vector(self, x):
+        # if self.hot_x_for_deriv_evals != x:
+        if not (np.array_equal(self.hot_x_for_deriv_evals, x)):
+            nx = self.nx
+            self.pf_px, self.pf_py, self.pc_px, self.pc_py, self.psi, self.pR_px, self.pR_py = self.model.evaluate_derivatives(
+                x[:nx],
+                x[nx:],
+                self.psi,
+                method=self.formulation,
+                tol=self.res_tol)
+            self.hot_x_for_deriv_evals[:] = 1. * x
+
+        return self.psi
+
+
+class Problem_om(object):
     def __init__(self,
                  model=None,
                  driver=None,

@@ -1,16 +1,65 @@
 import numpy as np
 
 from om_lite.core.system import System
+from om_lite.core.indepvarcomp import IndepVarComp
+from om_lite.core.explicitcomponent import ExplicitComponent
+from om_lite.core.implicitcomponent import ImplicitComponent
 
 
-class Component(System):
+class Model(System):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._inputs_list = []
-        self._outputs_list = []
-        self._partials_list = []
+        self.inputs = {}
+        self.outputs = {}
+        self.partials = {}
+        self.residuals = {}
+        # self.iv_components_list = []
+        self.ex_components_list = []
+        self.im_components_list = []
+
+    def add_subsystem(self, name, comp):
+        # self.name = comp
+        setattr(self, name, comp)
+        if isinstance(comp, IndepVarComp):
+            comp.inputs = self.inputs  # Even though ivc's don't have inputs, their outputs can also be inputs to other componentsin the model
+            comp.outputs = self.outputs
+            comp.setup()
+
+        elif isinstance(comp, ExplicitComponent):
+            comp.inputs = self.inputs
+            comp.outputs = self.outputs
+            comp.partials = self.partials
+            comp.setup()
+
+        elif isinstance(comp, ImplicitComponent):
+            comp.inputs = self.inputs
+            comp.outputs = self.outputs
+            comp.partials = self.partials
+            comp.residuals = self.residuals
+            comp.setup()
 
     def setup(self):
+        # Setup (Note: Promotes all)
+
+        # for comp in self.iv_components_list:
+        #     comp.inputs = self.inputs
+        #     comp.outputs = self.outputs
+        #     comp.partials = self.partials
+        #     comp.setup()
+
+        for comp in self.ex_components_list:
+            comp.inputs = self.inputs
+            comp.outputs = self.outputs
+            comp.partials = self.partials
+            comp.setup()
+
+        for comp in self.im_components_list:
+            comp.inputs = self.inputs
+            comp.outputs = self.outputs
+            comp.partials = self.partials
+            comp.residuals = self.residuals
+            comp.setup()
+
         pass
 
     def setup_partials(self):
@@ -21,7 +70,7 @@ class Component(System):
             # need more raise error to ensure same type and shape.
             self.inputs[name] = val
 
-        if name in self.outputs:
+        elif name in self.outputs:
             self.outputs[name] = val
 
         else:
@@ -38,10 +87,7 @@ class Component(System):
         if shape is None:
             self.inputs[name] = val
         else:
-            # self.inputs[name] = np.zeros(shape, dtype=float)
-            self.inputs[name] = self.outputs[name]
-
-        self._inputs_list += [name]
+            self.inputs[name] = np.zeros(shape, dtype=float)
 
     def add_output(self,
                    name,
@@ -56,8 +102,6 @@ class Component(System):
             self.outputs[name] = val
         else:
             self.outputs[name] = np.zeros(shape, dtype=float)
-
-        self._outputs_list += [name]
 
     def declare_partials(self,
                          of,
@@ -96,16 +140,16 @@ class Component(System):
                     self.partials[of, wrt] = val
 
         if of == '*' and wrt == '*':
-            for of_ in self._outputs_list:
-                for wrt_ in self._inputs_list:
+            for of_ in self.outputs:
+                for wrt_ in self.inputs:
                     _declare_partials(of_, wrt_)
 
         elif of == '*':
-            for of_ in self._outputs_list:
+            for of_ in self.outputs:
                 _declare_partials(of_, wrt)
 
         elif wrt == '*':
-            for wrt_ in self._inputs_list:
+            for wrt_ in self.inputs:
                 _declare_partials(of, wrt_)
 
         else:
